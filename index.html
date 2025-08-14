@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Bitcoin Difficulty Epoch Visualizer</title>
+<style>
+  :root {
+    --cols: 32;
+    --gap: 2px;
+    --cell-radius: 4px;
+    --bg: #0b0f14;
+    --panel: #0f1622;
+    --text: #e7f0ff;
+    --muted: #8aa1c1;
+    --pending: #27374b;
+    --fast: #24c486;     /* <= 8 min */
+    --normal: #f0c44e;   /* 8–15 min */
+    --slow: #e35b5b;     /* > 15 min */
+    --outline: #1b2b3e;
+    --accent: #49a2ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Apple Color Emoji","Segoe UI Emoji";
+    background: radial-gradient(1200px 600px at 20% -10%, #13202e, #0b0f14 50%);
+    color: var(--text);
+  }
+
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    backdrop-filter: blur(8px);
+    background: linear-gradient(180deg, rgba(11,15,20,0.9), rgba(11,15,20,0.6));
+    border-bottom: 1px solid var(--outline);
+  }
+  .wrap {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 16px;
+  }
+  h1 {
+    margin: 0 0 6px 0;
+    font-size: clamp(18px, 2.7vw, 28px);
+    letter-spacing: 0.2px;
+  }
+  .subtitle {
+    margin: 0 0 12px 0;
+    color: var(--muted);
+    font-size: 14px;
+  }
+
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 14px;
+    align-items: center;
+    margin: 8px 0 8px;
+  }
+  .controls .group {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--panel);
+    border: 1px solid var(--outline);
+    padding: 6px 10px;
+    border-radius: 8px;
+  }
+  .controls label { color: var(--muted); font-size: 13px; }
+  .controls select, .controls input, .controls button {
+    background: #0b1220;
+    color: var(--text);
+    border: 1px solid var(--outline);
+    padding: 6px 8px;
+    border-radius: 6px;
+    font-size: 14px;
+    outline: none;
+  }
+  .controls button {
+    cursor: pointer;
+    background: linear-gradient(180deg, #0b1220, #0a1626);
+  }
+  .controls button[data-state="running"] { border-color: #2f7af8; box-shadow: 0 0 0 1px rgba(73,162,255,0.3) inset; }
+  .controls button[data-state="paused"] { opacity: 0.9; }
+
+  .legend {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin: 10px 0 0;
+    font-size: 13px;
+  }
+  .legend .key {
+    display: inline-flex; align-items: center; gap: 6px;
+    color: var(--muted);
+  }
+  .legend .swatch {
+    width: 18px; height: 14px; border-radius: 4px; border: 1px solid var(--outline);
+  }
+  .swatch.pending { background: var(--pending); }
+  .swatch.fast { background: var(--fast); }
+  .swatch.normal { background: var(--normal); }
+  .swatch.slow { background: var(--slow); }
+
+  /* Epoch sections */
+  #epochs {
+    max-width: 1200px;
+    margin: 16px auto 90px;
+    display: grid;
+    gap: 18px;
+    padding: 0 16px;
+  }
+  .epoch {
+    background: linear-gradient(180deg, #0d1522, #0c131e);
+    border: 1px solid var(--outline);
+    border-radius: 12px;
+    overflow: clip;
+  }
+  .epoch-header {
+    display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: baseline;
+    padding: 12px 12px 10px 12px;
+    border-bottom: 1px solid var(--outline);
+    background: linear-gradient(180deg, rgba(17,30,49,0.7), rgba(13,21,34,0.7));
+  }
+  .epoch-title {
+    font-weight: 600;
+    font-size: 15px;
+  }
+  .epoch-meta {
+    color: var(--muted);
+    font-size: 12.5px;
+  }
+  .grid {
+    --rows: 63; /* default math for 2016 with 32 cols */
+    display: grid;
+    grid-template-columns: repeat(var(--cols), minmax(0,1fr));
+    gap: var(--gap);
+    padding: 12px;
+  }
+  .cell {
+    position: relative;
+    aspect-ratio: 1/1;
+    background: var(--pending);
+    border-radius: var(--cell-radius);
+    border: 1px solid #142233;
+    transition: transform 120ms ease, box-shadow 120ms ease, background 180ms ease;
+    outline: none;
+  }
+  .cell.mined.fast { background: var(--fast); }
+  .cell.mined.normal { background: var(--normal); }
+  .cell.mined.slow { background: var(--slow); }
+  .cell.mined.pop { transform: scale(1.06); box-shadow: 0 0 0 2px rgba(255,255,255,0.08) inset; }
+  .cell:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+
+  /* Tooltip */
+  #tooltip {
+    position: fixed;
+    z-index: 10;
+    pointer-events: none;
+    min-width: 260px;
+    max-width: min(420px, 94vw);
+    color: var(--text);
+    background: rgba(10, 15, 24, 0.92);
+    border: 1px solid var(--outline);
+    border-radius: 10px;
+    padding: 10px 12px;
+    box-shadow: 0 12px 24px rgba(0,0,0,0.35);
+    font-size: 13px;
+  }
+  #tooltip h4 { margin: 0 0 6px 0; font-size: 14px; }
+  #tooltip .row { display: flex; gap: 10px; justify-content: space-between; }
+  #tooltip .k { color: var(--muted); }
+  #tooltip .v { text-align: right; }
+
+  /* Footer note */
+  .note {
+    max-width: 1200px;
+    margin: 16px auto 28px;
+    color: var(--muted);
+    font-size: 12.5px;
+    padding: 0 16px;
+  }
+  a { color: #7fb6ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <h1>Bitcoin Difficulty Epoch Visualizer</h1>
+      <p class="subtitle">Each panel is one difficulty period (2016 blocks). As blocks are mined, cells light up. Hover a block for details; a new grid starts at each difficulty adjustment.</p>
+
+      <div class="controls" role="group" aria-label="Controls">
+        <div class="group">
+          <button id="toggleRun" data-state="running" aria-pressed="true">Pause</button>
+        </div>
+        <div class="group">
+          <label for="cols">Columns</label>
+          <input id="cols" type="number" min="8" max="63" value="32" />
+          <small style="color:var(--muted)">(2016 cells auto-wrap)</small>
+        </div>
+        <div class="group">
+          <label><input id="keepHistory" type="checkbox" checked /> Keep last 3 epochs</label>
+        </div>
+      </div>
+
+      <div class="legend" aria-hidden="true">
+        <span class="key"><span class="swatch pending"></span> Pending</span>
+        <span class="key"><span class="swatch fast"></span> Fast (&le; 8 min)</span>
+        <span class="key"><span class="swatch normal"></span> Normal (8–15 min)</span>
+        <span class="key"><span class="swatch slow"></span> Slow (&gt; 15 min)</span>
+      </div>
+    </div>
+  </header>
+
+  <main id="epochs" aria-live="polite"></main>
+
+  <div id="tooltip" role="tooltip" hidden></div>
+
+  <p class="note">
+    Live mode uses the public <code>mempool.space</code> API to fetch recent blocks and poll for new ones.
+  </p>
+
+<script>
+/* =========================
+   SETTINGS & CONSTANTS
+   ========================= */
+const BLOCKS_PER_EPOCH = 2016;
+const TARGET_BLOCK_TIME_SEC = 600;       // 10 minutes
+const ADJUSTMENT_MIN = 0.25;
+const ADJUSTMENT_MAX = 4.0;
+const EPOCHS_TO_KEEP = 3;
+
+let GRID_COLS = 32;
+let GRID_ROWS = Math.ceil(BLOCKS_PER_EPOCH / GRID_COLS);
+
+const $epochs = document.getElementById('epochs');
+const $tooltip = document.getElementById('tooltip');
+const $toggleRun = document.getElementById('toggleRun');
+const $cols = document.getElementById('cols');
+const $keepHistory = document.getElementById('keepHistory');
+
+function fmtNumber(n) { return Intl.NumberFormat().format(n); }
+function fmtTime(ts) {
+  try { return new Date(ts * 1000).toLocaleString(); }
+  catch { return ts.toString(); }
+}
+function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
+
+/* =========================
+   EPOCH CLASS
+   ========================= */
+class Epoch {
+  constructor(index, difficulty, startHeight, cols=GRID_COLS) {
+    this.index = index;
+    this.difficulty = difficulty;
+    this.startHeight = startHeight;
+    this.cols = cols;
+    this.rows = Math.ceil(BLOCKS_PER_EPOCH / cols);
+    this.blocks = new Array(BLOCKS_PER_EPOCH).fill(null);
+    this.blockTimes = [];
+    this.startTimestamp = null;
+    this.endTimestamp = null;
+
+    this.$root = document.createElement('section');
+    this.$root.className = 'epoch';
+    this.$root.setAttribute('aria-label', `Difficulty period ${index}`);
+
+    const header = document.createElement('div');
+    header.className = 'epoch-header';
+    header.innerHTML = \`
+      <div class="epoch-title">Epoch #\${fmtNumber(index)}</div>
+      <div class="epoch-meta">
+        start height <strong>\${fmtNumber(startHeight)}</strong> &nbsp;·&nbsp;
+        difficulty <strong>\${this.difficulty.toFixed(6)}</strong>
+      </div>
+    \`;
+
+    this.$grid = document.createElement('div');
+    this.$grid.className = 'grid';
+    this.$grid.style.setProperty('--cols', this.cols);
+    this.$grid.style.setProperty('--rows', this.rows);
+
+    this.$cells = [];
+    for (let i = 0; i < BLOCKS_PER_EPOCH; i++) {
+      const cell = document.createElement('div');
+      cell.className = 'cell';
+      cell.tabIndex = 0;
+      cell.dataset.index = i;
+      cell.dataset.mined = "false";
+      cell.ariaLabel = \`Unmined block slot \${i+1} in epoch \${index}\`;
+      this.$grid.appendChild(cell);
+      this.$cells.push(cell);
+    }
+
+    this.$root.appendChild(header);
+    this.$root.appendChild(this.$grid);
+  }
+
+  mount(parent) { parent.prepend(this.$root); }
+
+  addBlock(block, timeToMineSec) {
+    const idx = block.height % BLOCKS_PER_EPOCH;
+    if (this.blocks[idx]) return;
+    this.blocks[idx] = block;
+
+    if (!this.startTimestamp) this.startTimestamp = block.timestamp;
+    this.endTimestamp = block.timestamp;
+    if (idx > 0) this.blockTimes.push(timeToMineSec);
+
+    const cell = this.$cells[idx];
+    cell.dataset.mined = "true";
+    for (const [k,v] of Object.entries(block)) {
+      cell.dataset[k] = typeof v === 'object' ? JSON.stringify(v) : String(v);
+    }
+    cell.dataset.timeToMine = String(Math.round(timeToMineSec));
+
+    let speedClass = 'normal';
+    if (timeToMineSec <= 8*60) speedClass = 'fast';
+    else if (timeToMineSec > 15*60) speedClass = 'slow';
+    cell.classList.add('mined', speedClass, 'pop');
+    setTimeout(() => cell.classList.remove('pop'), 180);
+
+    cell.ariaLabel = \`Block \${fmtNumber(block.height)} mined in \${Math.round(timeToMineSec)} seconds by \${block.miner || 'unknown'}, \${block.txCount} transactions, \${Math.round((block.size||0)/1000)} KB\`;
+    return idx;
+  }
+
+  isComplete() { return this.blocks.filter(Boolean).length === BLOCKS_PER_EPOCH; }
+
+  computeNextDifficulty() {
+    const actualTimeSec = (this.endTimestamp ?? 0) - (this.startTimestamp ?? 0);
+    const expected = BLOCKS_PER_EPOCH * TARGET_BLOCK_TIME_SEC;
+    let factor = expected / Math.max(1, actualTimeSec);
+    factor = clamp(factor, ADJUSTMENT_MIN, ADJUSTMENT_MAX);
+    const next = clamp(this.difficulty * factor, 0.000001, Number.MAX_SAFE_INTEGER);
+    return { nextDifficulty: next, adjustmentFactor: factor, actualTimeSec };
+  }
+}
+
+/* =========================
+   APP STATE
+   ========================= */
+const App = {
+  running: true,
+  height: 0,
+  difficulty: 1.000000,
+  prevTimestamp: Math.floor(Date.now()/1000) - TARGET_BLOCK_TIME_SEC,
+  epochs: [],
+  currentEpoch: null,
+
+  ensureEpochForHeight(height) {
+    const epochIndex = Math.floor(height / BLOCKS_PER_EPOCH);
+    const startHeight = epochIndex * BLOCKS_PER_EPOCH;
+
+    if (!this.currentEpoch || this.currentEpoch.index !== epochIndex) {
+      if (this.currentEpoch) {
+        const { nextDifficulty, adjustmentFactor, actualTimeSec } = this.currentEpoch.computeNextDifficulty();
+        this.difficulty = nextDifficulty;
+        const meta = this.currentEpoch.$root.querySelector('.epoch-meta');
+        if (meta) {
+          const days = (actualTimeSec / 86400).toFixed(2);
+          meta.innerHTML += \` &nbsp;·&nbsp; elapsed <strong>\${days} days</strong> &nbsp;·&nbsp; adj <strong>\${adjustmentFactor.toFixed(3)}×</strong>\`;
+        }
+      }
+      const epoch = new Epoch(epochIndex, this.difficulty, startHeight, GRID_COLS);
+      epoch.mount($epochs);
+      this.epochs.unshift(epoch);
+      this.currentEpoch = epoch;
+
+      if (!$keepHistory.checked) {
+        while (this.epochs.length > 1) { const old = this.epochs.pop(); old.$root.remove(); }
+      } else {
+        while (this.epochs.length > EPOCHS_TO_KEEP) { const old = this.epochs.pop(); old.$root.remove(); }
+      }
+    }
+  }
+};
+
+/* =========================
+   TOOLTIP
+   ========================= */
+function showTooltipForCell(cell, evt) {
+  const tip = document.getElementById('tooltip');
+  if (!cell || cell.dataset.mined !== "true") {
+    tip.hidden = true; return;
+  }
+  const h = Number(cell.dataset.height);
+  const timeToMine = Number(cell.dataset.timeToMine);
+  const ts = Number(cell.dataset.timestamp);
+  const miner = cell.dataset.miner || 'unknown';
+  const txs = Number(cell.dataset.txCount || 0);
+  const size = Number(cell.dataset.size || 0);
+  const weight = Number(cell.dataset.weight || 0);
+  const fees = Number(cell.dataset.fees || 0);
+  const diff = Number(cell.dataset.difficulty || App.difficulty);
+
+  tip.innerHTML = \`
+    <h4>Block #\${fmtNumber(h)}</h4>
+    <div class="row"><span class="k">Mined</span><span class="v">\${fmtTime(ts)}</span></div>
+    <div class="row"><span class="k">Time to mine</span><span class="v">\${fmtNumber(timeToMine)} s</span></div>
+    <div class="row"><span class="k">Difficulty</span><span class="v">\${Number(diff).toFixed(6)}</span></div>
+    <div class="row"><span class="k">Miner</span><span class="v">\${miner}</span></div>
+    <div class="row"><span class="k">Transactions</span><span class="v">\${fmtNumber(txs)}</span></div>
+    <div class="row"><span class="k">Size</span><span class="v">\${fmtNumber(Math.round(size/1000))} KB</span></div>
+    <div class="row"><span class="k">Weight</span><span class="v">\${fmtNumber(weight)}</span></div>
+    <div class="row"><span class="k">Fees</span><span class="v">\${fees ? fees.toFixed(4) + ' BTC' : '-'}</span></div>
+    <div class="row"><span class="k">Hash</span><span class="v" style="max-width:220px;overflow-wrap:anywhere">\${cell.dataset.hash || '-'}</span></div>
+  \`;
+  const pad = 14;
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const box = tip.getBoundingClientRect();
+  let x = evt.clientX + pad, y = evt.clientY + pad;
+  if (x + box.width > vw - 8) x = evt.clientX - box.width - pad;
+  if (y + box.height > vh - 8) y = evt.clientY - box.height - pad;
+  tip.style.left = \`\${x}px\`;
+  tip.style.top = \`\${y}px\`;
+  tip.hidden = false;
+}
+
+$epochs.addEventListener('mousemove', (e) => {
+  const cell = e.target.closest('.cell');
+  showTooltipForCell(cell, e);
+});
+$epochs.addEventListener('mouseleave', () => { $tooltip.hidden = true; });
+
+/* =========================
+   LIVE DATA (REST polling via mempool.space)
+   ========================= */
+const API = 'https://mempool.space/api';
+let highestSeen = -1;
+
+function addBlock(block) {
+  App.ensureEpochForHeight(block.height);
+  const timeToMine = Math.max(1, block.timestamp - App.prevTimestamp);
+  App.prevTimestamp = block.timestamp;
+  App.currentEpoch.addBlock(block, timeToMine);
+}
+
+// Backfill some recent blocks (enough to populate current epoch area)
+async function backfillCurrentEpoch() {
+  try {
+    const arr = await fetch(\`\${API}/blocks\`).then(r => r.json());
+    const blocks = [...arr].reverse(); // oldest-first
+    for (const b of blocks) {
+      addBlock({
+        height: b.height,
+        hash: b.id,
+        timestamp: b.timestamp,
+        miner: b.extras?.pool || b.pool || 'unknown',
+        txCount: b.tx_count,
+        size: b.size || 0,
+        weight: b.weight || 0,
+        fees: 0,
+        difficulty: App.difficulty
+      });
+      highestSeen = Math.max(highestSeen, b.height);
+      App.height = highestSeen + 1;
+    }
+  } catch(e) { console.warn('backfill error', e); }
+}
+
+async function enrichBlock(hash) {
+  try {
+    const b = await fetch(\`\${API}/block/\${hash}\`).then(r => r.json());
+    return {
+      miner: b.extras?.pool || 'unknown',
+      size: b.size || 0,
+      weight: b.weight || 0,
+      fees: (b.fees || 0) / 1e8
+    };
+  } catch { return {}; }
+}
+
+async function poll() {
+  if (!App.running) return;
+  try {
+    const arr = await fetch(\`\${API}/blocks\`).then(r => r.json());
+    const unseen = arr.filter(b => b.height > highestSeen).sort((a,b)=>a.height-b.height);
+    for (const raw of unseen) {
+      const extra = await enrichBlock(raw.id);
+      const block = {
+        height: raw.height,
+        hash: raw.id,
+        timestamp: raw.timestamp,
+        miner: extra.miner || raw.extras?.pool || 'unknown',
+        txCount: raw.tx_count,
+        size: extra.size ?? raw.size ?? 0,
+        weight: extra.weight ?? raw.weight ?? 0,
+        fees: extra.fees ?? 0,
+        difficulty: App.difficulty
+      };
+      addBlock(block);
+      highestSeen = raw.height;
+      App.height = highestSeen + 1;
+    }
+  } catch (e) { console.warn('poll error', e); }
+}
+
+/* =========================
+   CONTROLS
+   ========================= */
+document.getElementById('toggleRun').addEventListener('click', () => {
+  App.running = !App.running;
+  const btn = document.getElementById('toggleRun');
+  btn.dataset.state = App.running ? 'running' : 'paused';
+  btn.textContent = App.running ? 'Pause' : 'Resume';
+  btn.setAttribute('aria-pressed', String(App.running));
+});
+
+$cols.addEventListener('change', () => {
+  let v = parseInt($cols.value, 10);
+  if (!Number.isFinite(v) || v < 8) v = 8;
+  if (v > 63) v = 63;
+  GRID_COLS = v;
+  GRID_ROWS = Math.ceil(BLOCKS_PER_EPOCH / GRID_COLS);
+  if (App.currentEpoch) {
+    const idx = App.currentEpoch.index;
+    const sh = App.currentEpoch.startHeight;
+    const diff = App.currentEpoch.difficulty;
+    const clone = new Epoch(idx, diff, sh, GRID_COLS);
+    App.currentEpoch.blocks.forEach((b, i) => {
+      if (b) {
+        const oldCell = App.currentEpoch.$cells[i];
+        const t = Number(oldCell?.dataset?.timeToMine || TARGET_BLOCK_TIME_SEC);
+        clone.addBlock(b, t);
+      }
+    });
+    App.currentEpoch.$root.replaceWith(clone.$root);
+    App.epochs[0] = clone;
+    App.currentEpoch = clone;
+  }
+});
+
+$keepHistory.addEventListener('change', () => {
+  if (!$keepHistory.checked) {
+    while (App.epochs.length > 1) { const old = App.epochs.pop(); old.$root.remove(); }
+  }
+});
+
+/* =========================
+   BOOT
+   ========================= */
+(function init(){
+  App.height = 0;
+  App.prevTimestamp = Math.floor(Date.now()/1000) - TARGET_BLOCK_TIME_SEC;
+  App.ensureEpochForHeight(App.height);
+  backfillCurrentEpoch().then(() => {
+    setInterval(poll, 10000); // poll every 10s
+  });
+})();
+</script>
+</body>
+</html>
