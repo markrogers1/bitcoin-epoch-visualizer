@@ -128,14 +128,9 @@
     border-bottom: 1px solid var(--outline);
     background: linear-gradient(180deg, rgba(17,30,49,0.7), rgba(13,21,34,0.7));
   }
-  .epoch-title {
-    font-weight: 600;
-    font-size: 15px;
-  }
-  .epoch-meta {
-    color: var(--muted);
-    font-size: 12.5px;
-  }
+  .epoch-title { font-weight: 600; font-size: 15px; }
+  .epoch-meta { color: var(--muted); font-size: 12.5px; }
+
   .grid {
     --rows: 63; /* default math for 2016 with 32 cols */
     display: grid;
@@ -271,6 +266,7 @@ function setStatus(type, msg) {
   if (type === "ok") cls += "ok";
   else if (type === "warn") cls += "warn";
   else cls += "error";
+  // ✅ CSP-safe (no eval): string literals only, no dynamic handlers
   $status.innerHTML = '<span class="'+cls+'">'+ (type==="ok"?"Live":"Loading") +'</span> ' + msg;
 }
 
@@ -295,7 +291,6 @@ class Epoch {
 
     const header = document.createElement('div');
     header.className = 'epoch-header';
-    /* ***** THE ONLY FIX APPLIED ***** */
     header.innerHTML = `
       <div class="epoch-title">Epoch #${fmtNumber(index)}</div>
       <div class="epoch-meta">
@@ -303,7 +298,6 @@ class Epoch {
         difficulty <strong>${this.difficulty.toFixed(6)}</strong>
       </div>
     `;
-    /* ******************************** */
 
     this.$grid = document.createElement('div');
     this.$grid.className = 'grid';
@@ -329,7 +323,9 @@ class Epoch {
   mount(parent) { parent.prepend(this.$root); }
 
   addBlock(block, timeToMineSec) {
-    const idx = block.height % BLOCKS_PER_EPOCH;
+    // Position within this epoch
+    const idx = block.height - this.startHeight; // equivalent to height % 2016 but clearer
+    if (idx < 0 || idx >= BLOCKS_PER_EPOCH) return;
     if (this.blocks[idx]) return;
     this.blocks[idx] = block;
 
@@ -376,6 +372,7 @@ const App = {
   currentEpoch: null,
   simulatorTimer: null,
   liveMode: "loading", // "loading" | "live" | "demo"
+  epochStart: 0,
 
   ensureEpochForHeight(height) {
     const epochIndex = Math.floor(height / BLOCKS_PER_EPOCH);
@@ -391,6 +388,7 @@ const App = {
           meta.innerHTML += ` &nbsp;·&nbsp; elapsed <strong>${days} days</strong> &nbsp;·&nbsp; adj <strong>${adjustmentFactor.toFixed(3)}×</strong>`;
         }
       }
+      this.epochStart = startHeight;
       const epoch = new Epoch(epochIndex, this.difficulty, startHeight, GRID_COLS);
       epoch.mount($epochs);
       this.epochs.unshift(epoch);
@@ -451,7 +449,7 @@ $epochs.addEventListener('mousemove', (e) => {
 $epochs.addEventListener('mouseleave', () => { $tooltip.hidden = true; });
 
 /* =========================
-   LIVE DATA (REST polling + fallback)
+   LIVE DATA (REST polling + full-epoch backfill + fallback)
    ========================= */
 const API = 'https://mempool.space/api';
 let highestSeen = -1;
@@ -460,6 +458,7 @@ let consecutiveErrors = 0;
 const ERROR_THRESHOLD = 3;   // after 3 failed polls, switch to demo
 let pollingInterval = null;
 
+/* ---- helpers ---- */
 function addBlock(block) {
   App.ensureEpochForHeight(block.height);
   const timeToMine = Math.max(1, block.timestamp - App.prevTimestamp);
@@ -472,58 +471,96 @@ function addBlock(block) {
   }
 }
 
-async function backfillCurrentEpoch() {
+/* Fetch the latest ~15 blocks */
+async function fetchLatestBlocks() {
+  const arr = await fetch(`${API}/blocks`).then(r => r.json());
+  if (!Array.isArray(arr) || !arr.length) return [];
+  // newest-first from API -> return as newest-first
+  return arr;
+}
+
+/* Fetch a page of older blocks starting at (and including) startHeight */
+async function fetchBlocksPage(startHeight) {
+  // API returns a page of blocks at or below startHeight (newest-first)
+  const arr = await fetch(`${API}/blocks/${startHeight}`).then(r => r.json());
+  if (!Array.isArray(arr)) return [];
+  return arr;
+}
+
+/* Backfill the ENTIRE current epoch by paging older blocks until epochStart */
+async function backfillEpochFully() {
+  setStatus("warn", "Loading current epoch…");
   try {
-    setStatus("warn", "Loading blocks…");
-    const arr = await fetch(`${API}/blocks`).then(r => r.json());
-    const blocks = [...arr].reverse();
-    for (const b of blocks) {
-      addBlock({
-        height: b.height,
-        hash: b.id,
-        timestamp: b.timestamp,
-        miner: b.extras?.pool || b.pool || 'unknown',
-        txCount: b.tx_count,
-        size: b.size || 0,
-        weight: b.weight || 0,
-        fees: 0,
-        difficulty: App.difficulty
-      });
-      highestSeen = Math.max(highestSeen, b.height);
-      App.height = highestSeen + 1;
+    const latest = await fetchLatestBlocks();         // newest-first
+    if (!latest.length) throw new Error("No blocks");
+
+    // Determine tip & epoch start
+    const tipHeight = latest[0].height;
+    App.ensureEpochForHeight(tipHeight);
+    const epochStart = App.epochStart;
+
+    // We’ll collect all blocks >= epochStart (oldest-first for stable rendering)
+    const collected = [];
+    let page = latest.slice(); // newest-first
+    let oldestInHand = page[page.length - 1]?.height ?? tipHeight;
+
+    // Include pages until we’ve covered the epoch start
+    while (true) {
+      // Keep only blocks from this epoch
+      for (const b of page) if (b.height >= epochStart) collected.push(b);
+      if (oldestInHand <= epochStart || page.length === 0) break;
+      const nextStart = oldestInHand - 1;
+      page = await fetchBlocksPage(nextStart); // newest-first
+      if (!page.length) break;
+      oldestInHand = page[page.length - 1].height;
     }
+
+    // Draw (oldest-first), enrich as we go a bit
+    collected
+      .filter(b => b.height >= epochStart)
+      .sort((a,b)=>a.height-b.height)
+      .forEach(b => {
+        addBlock({
+          height: b.height,
+          hash: b.id,
+          timestamp: b.timestamp,
+          miner: b.extras?.pool || b.pool || 'unknown',
+          txCount: b.tx_count,
+          size: b.size || 0,
+          weight: b.weight || 0,
+          fees: 0,
+          difficulty: App.difficulty
+        });
+        highestSeen = Math.max(highestSeen, b.height);
+        App.height = highestSeen + 1;
+      });
+
+    setStatus("ok", `Live — epoch starting at ${fmtNumber(epochStart)}`);
     if (!gotAtLeastOneBlock) setStatus("warn", "Waiting for the next block…");
-  } catch(e) {
-    console.warn('backfill error', e);
+  } catch (e) {
+    console.warn('epoch backfill error', e);
     consecutiveErrors++;
     if (consecutiveErrors >= ERROR_THRESHOLD) startDemo("API unreachable during load. Showing demo.");
     else setStatus("warn", "Network hiccup… retrying.");
   }
 }
 
-async function enrichBlock(hash) {
-  try {
-    const b = await fetch(`${API}/block/${hash}`).then(r => r.json());
-    return { miner: b.extras?.pool || 'unknown', size: b.size || 0, weight: b.weight || 0, fees: (b.fees || 0) / 1e8 };
-  } catch { return {}; }
-}
-
+/* After initial fill, poll tip for new blocks */
 async function poll() {
   if (!App.running || App.liveMode === "demo") return;
   try {
-    const arr = await fetch(`${API}/blocks`).then(r => r.json());
+    const arr = await fetchLatestBlocks(); // newest-first
     const unseen = arr.filter(b => b.height > highestSeen).sort((a,b)=>a.height-b.height);
     for (const raw of unseen) {
-      const extra = await enrichBlock(raw.id);
       const block = {
         height: raw.height,
         hash: raw.id,
         timestamp: raw.timestamp,
-        miner: extra.miner || raw.extras?.pool || 'unknown',
+        miner: raw.extras?.pool || raw.pool || 'unknown',
         txCount: raw.tx_count,
-        size: extra.size ?? raw.size ?? 0,
-        weight: extra.weight ?? raw.weight ?? 0,
-        fees: extra.fees ?? 0,
+        size: raw.size || 0,
+        weight: raw.weight || 0,
+        fees: 0,
         difficulty: App.difficulty
       };
       addBlock(block);
@@ -531,10 +568,6 @@ async function poll() {
       App.height = highestSeen + 1;
     }
     consecutiveErrors = 0;
-    if (App.liveMode === "loading" && gotAtLeastOneBlock) {
-      App.liveMode = "live";
-      setStatus("ok", "Live data connected. New blocks will appear automatically.");
-    }
   } catch (e) {
     console.warn('poll error', e);
     consecutiveErrors++;
@@ -574,33 +607,16 @@ function stopDemo() {
 setInterval(async () => {
   if (App.liveMode !== "demo") return;
   try {
-    const arr = await fetch(`${API}/blocks`).then(r => r.json());
+    const arr = await fetchLatestBlocks();
     if (Array.isArray(arr) && arr.length) {
-      // switch back to live, feed any missing
       const newest = Math.max(...arr.map(x=>x.height));
       if (newest > highestSeen) {
-        const blocks = [...arr].sort((a,b)=>a.height-b.height);
-        for (const raw of blocks) {
-          if (raw.height > highestSeen) {
-            addBlock({
-              height: raw.height,
-              hash: raw.id,
-              timestamp: raw.timestamp,
-              miner: raw.extras?.pool || raw.pool || 'unknown',
-              txCount: raw.tx_count,
-              size: raw.size || 0,
-              weight: raw.weight || 0,
-              fees: 0,
-              difficulty: App.difficulty
-            });
-            highestSeen = raw.height;
-            App.height = highestSeen + 1;
-          }
-        }
+        // Refill from epoch start again to ensure continuity
+        await backfillEpochFully();
       }
       stopDemo();
     }
-  } catch (e) {
+  } catch {
     // still down; keep demo running
   }
 }, 15000);
@@ -666,13 +682,13 @@ $keepHistory.addEventListener('change', () => {
 /* =========================
    BOOT
    ========================= */
-(function init(){
+(async function init(){
   App.height = 0;
   App.prevTimestamp = Math.floor(Date.now()/1000) - TARGET_BLOCK_TIME_SEC;
-  App.ensureEpochForHeight(App.height);
-  backfillCurrentEpoch().then(() => {
-    pollingInterval = setInterval(poll, 10000);
-  });
+  // Fill the whole current epoch (not just ~15 recent blocks)
+  await backfillEpochFully();
+  // Then poll for new blocks
+  pollingInterval = setInterval(poll, 10000); // ✅ CSP-safe: function ref, not string
 })();
 </script>
 </body>
