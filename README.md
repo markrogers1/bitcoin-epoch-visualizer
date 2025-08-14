@@ -9,11 +9,10 @@ An interactive, mempool-style grid that visualizes **Bitcoin difficulty epochs**
 
 ## Demo (GitHub Pages)
 
-After you publish, your site will be available at:
+site will be available at:
 
 ```
-https://<your-username>.github.io/bitcoin-epoch-visualizer/
-```
+](https://markrogers1.github.io/bitcoin-epoch-visualizer/)```
 
 ## How it works
 
