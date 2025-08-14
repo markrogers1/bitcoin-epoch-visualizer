@@ -19,6 +19,9 @@
     --slow: #e35b5b;     /* > 15 min */
     --outline: #1b2b3e;
     --accent: #49a2ff;
+    --warn: #ffb454;
+    --error: #ff6b6b;
+    --ok: #3ad29f;
   }
   * { box-sizing: border-box; }
   body {
@@ -175,7 +178,18 @@
   #tooltip .k { color: var(--muted); }
   #tooltip .v { text-align: right; }
 
-  /* Footer note */
+  .statusbar {
+    max-width: 1200px;
+    margin: 10px auto 0;
+    padding: 8px 16px;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--outline); margin-right: 8px; }
+  .badge.ok { color: var(--ok); border-color: rgba(58,210,159,0.4); }
+  .badge.warn { color: var(--warn); border-color: rgba(255,180,84,0.4); }
+  .badge.error { color: var(--error); border-color: rgba(255,107,107,0.4); }
+
   .note {
     max-width: 1200px;
     margin: 16px auto 28px;
@@ -216,12 +230,14 @@
     </div>
   </header>
 
+  <div class="statusbar" id="status"><span class="badge warn">Loading</span> Loading blocks…</div>
+
   <main id="epochs" aria-live="polite"></main>
 
   <div id="tooltip" role="tooltip" hidden></div>
 
   <p class="note">
-    Live mode uses the public <code>mempool.space</code> API to fetch recent blocks and poll for new ones.
+    Uses the public <code>mempool.space</code> API. If the API is slow or unreachable, the page will automatically switch to a built-in demo so it never looks blank.
   </p>
 
 <script>
@@ -229,7 +245,7 @@
    SETTINGS & CONSTANTS
    ========================= */
 const BLOCKS_PER_EPOCH = 2016;
-const TARGET_BLOCK_TIME_SEC = 600;       // 10 minutes
+const TARGET_BLOCK_TIME_SEC = 600;
 const ADJUSTMENT_MIN = 0.25;
 const ADJUSTMENT_MAX = 4.0;
 const EPOCHS_TO_KEEP = 3;
@@ -242,13 +258,21 @@ const $tooltip = document.getElementById('tooltip');
 const $toggleRun = document.getElementById('toggleRun');
 const $cols = document.getElementById('cols');
 const $keepHistory = document.getElementById('keepHistory');
+const $status = document.getElementById('status');
 
 function fmtNumber(n) { return Intl.NumberFormat().format(n); }
-function fmtTime(ts) {
-  try { return new Date(ts * 1000).toLocaleString(); }
-  catch { return ts.toString(); }
-}
+function fmtTime(ts) { try { return new Date(ts * 1000).toLocaleString(); } catch { return ts.toString(); } }
 function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
+function expRand(mean) { return -Math.log(1 - Math.random()) * mean; }
+
+function setStatus(type, msg) {
+  if (!$status) return;
+  let cls = "badge ";
+  if (type === "ok") cls += "ok";
+  else if (type === "warn") cls += "warn";
+  else cls += "error";
+  $status.innerHTML = '<span class="'+cls+'">'+ (type==="ok"?"Live":"Loading") +'</span> ' + msg;
+}
 
 /* =========================
    EPOCH CLASS
@@ -328,8 +352,6 @@ class Epoch {
     return idx;
   }
 
-  isComplete() { return this.blocks.filter(Boolean).length === BLOCKS_PER_EPOCH; }
-
   computeNextDifficulty() {
     const actualTimeSec = (this.endTimestamp ?? 0) - (this.startTimestamp ?? 0);
     const expected = BLOCKS_PER_EPOCH * TARGET_BLOCK_TIME_SEC;
@@ -350,6 +372,8 @@ const App = {
   prevTimestamp: Math.floor(Date.now()/1000) - TARGET_BLOCK_TIME_SEC,
   epochs: [],
   currentEpoch: null,
+  simulatorTimer: null,
+  liveMode: "loading", // "loading" | "live" | "demo"
 
   ensureEpochForHeight(height) {
     const epochIndex = Math.floor(height / BLOCKS_PER_EPOCH);
@@ -384,9 +408,7 @@ const App = {
    ========================= */
 function showTooltipForCell(cell, evt) {
   const tip = document.getElementById('tooltip');
-  if (!cell || cell.dataset.mined !== "true") {
-    tip.hidden = true; return;
-  }
+  if (!cell || cell.dataset.mined !== "true") { tip.hidden = true; return; }
   const h = Number(cell.dataset.height);
   const timeToMine = Number(cell.dataset.timeToMine);
   const ts = Number(cell.dataset.timestamp);
@@ -427,23 +449,32 @@ $epochs.addEventListener('mousemove', (e) => {
 $epochs.addEventListener('mouseleave', () => { $tooltip.hidden = true; });
 
 /* =========================
-   LIVE DATA (REST polling via mempool.space)
+   LIVE DATA (REST polling + fallback)
    ========================= */
 const API = 'https://mempool.space/api';
 let highestSeen = -1;
+let gotAtLeastOneBlock = false;
+let consecutiveErrors = 0;
+const ERROR_THRESHOLD = 3;   // after 3 failed polls, switch to demo
+let pollingInterval = null;
 
 function addBlock(block) {
   App.ensureEpochForHeight(block.height);
   const timeToMine = Math.max(1, block.timestamp - App.prevTimestamp);
   App.prevTimestamp = block.timestamp;
   App.currentEpoch.addBlock(block, timeToMine);
+  if (!gotAtLeastOneBlock) {
+    gotAtLeastOneBlock = true;
+    App.liveMode = "live";
+    setStatus("ok", "Live data connected. New blocks will appear automatically.");
+  }
 }
 
-// Backfill some recent blocks (enough to populate current epoch area)
 async function backfillCurrentEpoch() {
   try {
+    setStatus("warn", "Loading blocks…");
     const arr = await fetch(\`\${API}/blocks\`).then(r => r.json());
-    const blocks = [...arr].reverse(); // oldest-first
+    const blocks = [...arr].reverse();
     for (const b of blocks) {
       addBlock({
         height: b.height,
@@ -459,23 +490,24 @@ async function backfillCurrentEpoch() {
       highestSeen = Math.max(highestSeen, b.height);
       App.height = highestSeen + 1;
     }
-  } catch(e) { console.warn('backfill error', e); }
+    if (!gotAtLeastOneBlock) setStatus("warn", "Waiting for the next block…");
+  } catch(e) {
+    console.warn('backfill error', e);
+    consecutiveErrors++;
+    if (consecutiveErrors >= ERROR_THRESHOLD) startDemo("API unreachable during load. Showing demo.");
+    else setStatus("warn", "Network hiccup… retrying.");
+  }
 }
 
 async function enrichBlock(hash) {
   try {
     const b = await fetch(\`\${API}/block/\${hash}\`).then(r => r.json());
-    return {
-      miner: b.extras?.pool || 'unknown',
-      size: b.size || 0,
-      weight: b.weight || 0,
-      fees: (b.fees || 0) / 1e8
-    };
+    return { miner: b.extras?.pool || 'unknown', size: b.size || 0, weight: b.weight || 0, fees: (b.fees || 0) / 1e8 };
   } catch { return {}; }
 }
 
 async function poll() {
-  if (!App.running) return;
+  if (!App.running || App.liveMode === "demo") return;
   try {
     const arr = await fetch(\`\${API}/blocks\`).then(r => r.json());
     const unseen = arr.filter(b => b.height > highestSeen).sort((a,b)=>a.height-b.height);
@@ -496,7 +528,96 @@ async function poll() {
       highestSeen = raw.height;
       App.height = highestSeen + 1;
     }
-  } catch (e) { console.warn('poll error', e); }
+    consecutiveErrors = 0;
+    if (App.liveMode === "loading" && gotAtLeastOneBlock) {
+      App.liveMode = "live";
+      setStatus("ok", "Live data connected. New blocks will appear automatically.");
+    }
+  } catch (e) {
+    console.warn('poll error', e);
+    consecutiveErrors++;
+    if (consecutiveErrors >= ERROR_THRESHOLD && App.liveMode !== "demo") {
+      startDemo("API seems down. Switched to demo (will keep retrying in background).");
+    } else {
+      setStatus("warn", "Having trouble contacting API… will retry.");
+    }
+  }
+}
+
+/* =========================
+   DEMO FALLBACK
+   ========================= */
+function startDemo(reason) {
+  App.liveMode = "demo";
+  setStatus("error", reason);
+  if (App.simulatorTimer) clearInterval(App.simulatorTimer);
+  if (!gotAtLeastOneBlock) {
+    // Ensure at least an empty epoch exists
+    App.height = 0;
+    App.prevTimestamp = Math.floor(Date.now()/1000) - TARGET_BLOCK_TIME_SEC;
+    App.ensureEpochForHeight(App.height);
+  }
+  App.simulatorTimer = setInterval(simulateNextBlock, 1000);
+}
+
+function stopDemo() {
+  if (App.simulatorTimer) { clearInterval(App.simulatorTimer); App.simulatorTimer = null; }
+  if (App.liveMode === "demo") {
+    App.liveMode = "live";
+    setStatus("ok", "Reconnected to live data.");
+  }
+}
+
+// keep trying to recover live mode in background
+setInterval(async () => {
+  if (App.liveMode !== "demo") return;
+  try {
+    const arr = await fetch(\`\${API}/blocks\`).then(r => r.json());
+    if (Array.isArray(arr) && arr.length) {
+      // switch back to live, feed any missing
+      const newest = Math.max(...arr.map(x=>x.height));
+      if (newest > highestSeen) {
+        const blocks = [...arr].sort((a,b)=>a.height-b.height);
+        for (const raw of blocks) {
+          if (raw.height > highestSeen) {
+            addBlock({
+              height: raw.height,
+              hash: raw.id,
+              timestamp: raw.timestamp,
+              miner: raw.extras?.pool || raw.pool || 'unknown',
+              txCount: raw.tx_count,
+              size: raw.size || 0,
+              weight: raw.weight || 0,
+              fees: 0,
+              difficulty: App.difficulty
+            });
+            highestSeen = raw.height;
+            App.height = highestSeen + 1;
+          }
+        }
+      }
+      stopDemo();
+    }
+  } catch (e) {
+    // still down; keep demo running
+  }
+}, 15000);
+
+/* ===== DEMO BLOCK GEN ===== */
+function simulateNextBlock() {
+  const t = expRand(TARGET_BLOCK_TIME_SEC);
+  const now = App.prevTimestamp + Math.round(t);
+  const height = App.height;
+  const minerList = ['Foundry USA', 'AntPool', 'F2Pool', 'ViaBTC', 'Luxor', 'BINANCE', 'Solo CK'];
+  const miner = minerList[Math.floor(Math.random()*minerList.length)];
+  const txCount = 1000 + Math.floor(Math.random()*2000);
+  const size = 900_000 + Math.floor(Math.random()*700_000);
+  const weight = 3_000_000 + Math.floor(Math.random()*800_000);
+  const feesBtc = Number((Math.random()*0.8).toFixed(4));
+  const hash = [...crypto.getRandomValues(new Uint8Array(16))].map(b => b.toString(16).padStart(2,'0')).join('');
+  const block = { height, hash, timestamp: now, miner, txCount, size, weight, fees: feesBtc, difficulty: App.difficulty };
+  addBlock(block);
+  App.height += 1;
 }
 
 /* =========================
@@ -548,7 +669,7 @@ $keepHistory.addEventListener('change', () => {
   App.prevTimestamp = Math.floor(Date.now()/1000) - TARGET_BLOCK_TIME_SEC;
   App.ensureEpochForHeight(App.height);
   backfillCurrentEpoch().then(() => {
-    setInterval(poll, 10000); // poll every 10s
+    pollingInterval = setInterval(poll, 10000);
   });
 })();
 </script>
